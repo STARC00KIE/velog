@@ -1,0 +1,528 @@
+<h2 id="목표">목표</h2>
+<ul>
+<li>파이프라인 조사하기</li>
+<li>Poppler가 어떤 기능을 하는지 조사하기</li>
+<li>PageResponse가 어디에 호출되고 사용되는지 조사하기</li>
+</ul>
+<hr />
+<h2 id="파이프라인-개요">파이프라인 개요</h2>
+<ul>
+<li>수많은 PDF 파일을 입력받아, 각각의 페이지를 개별적으로 AI 모델을 이용하여 병렬적으로 추론을 진행하고 결과 종합</li>
+</ul>
+<hr />
+<h2 id="1-진입점entry-point">1. 진입점(Entry Point)</h2>
+<h3 id="사용-함수">사용 함수</h3>
+<ul>
+<li><code>def main()</code></li>
+</ul>
+<h3 id="설명">설명</h3>
+<ul>
+<li>파이프라인 전체의 시작점</li>
+</ul>
+<h3 id="세부-역할">세부 역할</h3>
+<ol>
+<li><p>설정 및 인자 파싱</p>
+</li>
+<li><p>환경 설정: Beaker 클러스터 여부 확인, AWS/GCS 인증 정보 설정, 클라이언트 초기화</p>
+</li>
+<li><p><code>work_queue</code> 준비(앞으로 처리해야 할 작업들의 목록을 담아두는 저장소)</p>
+</li>
+<li><p>추론 환경 준비 및 vllm 서버 시작</p>
+</li>
+<li><p><strong>worker 실행 및 관리</strong></p>
+<pre><code class="language-python"> &quot;&quot;&quot;
+ work_queue: 앞으로 처리해야 할 작업들의 목록을 담아두는 저장소
+ semaphore: 동시에 접근할 수 있는 작업 수(1개)
+    worker_id: worker에게 부여되는 식별자
+ task: worker의 실행 상태를 제어하고 조회하는 데 사용되는 객체
+ &quot;&quot;&quot;
+ metrics_task = asyncio.create_task(metrics_reporter(work_queue))
+
+ # 큐를 동시에 처리하기 위해 worker_tasks 들을 생성함
+ worker_tasks = []
+ for i in range(args.workers):
+     task = asyncio.create_task(worker(args, work_queue, semaphore, worker_id=i))
+     worker_tasks.append(task)
+
+ # 모든 task가 끝날 때까지 대기
+ await asyncio.gather(*worker_tasks)</code></pre>
+</li>
+<li><p>정리 및 최종 결과 출력</p>
+</li>
+</ol>
+<hr />
+<h2 id="2-작업-분배">2. 작업 분배</h2>
+<h3 id="사용-함수-1">사용 함수</h3>
+<ul>
+<li><code>def worker()</code></li>
+</ul>
+<h3 id="설명-1">설명</h3>
+<ul>
+<li>작업 분배 및 실행</li>
+</ul>
+<h3 id="세부-역할-1">세부 역할</h3>
+<ol>
+<li><p>작업 권한 획득 및 할당</p>
+</li>
+<li><p><strong>PDF 동시에 처리</strong></p>
+<pre><code class="language-python">     &quot;&quot;&quot;
+     work_item.work_paths: 치리해야 할 PDF 파일들의 경로가 담겨져 있는 리스트
+     pdf: 처리할 단일 PDF 파일의 경로를 나타내는 문자열
+     dolma_tasks: 한 worker가 처리해야 할 모든 PDF 파일에 대한 process_pdf 태스크 객체(실행 상태, 결과)들을 모아놓은 리스트
+     tg.create_task()가 호출될 때 process_pdf(...) 태스크 생성 및 TaskGroup에 등록되어 즉시 실행 시작
+     &quot;&quot;&quot;
+     try:
+         async with asyncio.TaskGroup() as tg:
+             dolma_tasks = [tg.create_task(process_pdf(args, worker_id, pdf)) for pdf in work_item.work_paths]
+             logger.info(f&quot;Created all tasks for {work_item.hash}&quot;)
+
+         logger.info(f&quot;Finished TaskGroup for worker on {work_item.hash}&quot;)</code></pre>
+</li>
+<li><p>결과 집계 및 오류 처리</p>
+</li>
+<li><p>최종 결과물 생성 및 저장</p>
+</li>
+<li><p>마크다운 파일 생성</p>
+</li>
+<li><p>작업 완료 보고 및 메트릭 업데이트</p>
+</li>
+<li><p>예외 처리 및 세마포어 해제</p>
+</li>
+</ol>
+<hr />
+<h2 id="3-개별-pdf-파일-처리">3. 개별 PDF 파일 처리</h2>
+<h3 id="사용-함수-2">사용 함수</h3>
+<ul>
+<li><code>def process_pdf()</code></li>
+</ul>
+<h3 id="설명-2">설명</h3>
+<ul>
+<li>단일 PDF 파일 하나를 처음부터 끝까지 처리하는 함수</li>
+</ul>
+<h3 id="세부-역할-2">세부 역할</h3>
+<ol>
+<li><p>PDF 임시 파일 생성</p>
+</li>
+<li><p>PDF 유효성 검사 및 필터링</p>
+<pre><code class="language-python"> &quot;&quot;&quot;
+ reader: PDF 파일을 열고 내부 정보에 접근할 수 있게 해주는 객체
+ num_pages: `reader`를 통해 알아낸 PDF 파일의 전체 페이지 수, 작업량을 결정
+    &quot;&quot;&quot;
+ try:
+     try:
+         reader = PdfReader(tf.name) # pypdf의 PdfReader 클래스 사용
+         num_pages = reader.get_num_pages()
+     except:
+         logger.exception(f&quot;Could not count number of pages for {pdf_orig_path}, aborting document&quot;)
+         return None</code></pre>
+</li>
+<li><p><strong>페이지 단위 동시 처리</strong></p>
+<pre><code class="language-python">     &quot;&quot;&quot;
+     page_tasks: 실행 중, 또는 완료된 각 페이지 처리 작업(tast) 자체를 가리키는 객체들의 리스트
+     page_results: 모든 페이지 작업이 성공적으로 끝난 후의 반환값들을 모아놓은 리스트
+     &quot;&quot;&quot;
+     page_tasks = []
+     page_results = []
+
+     try:
+         async with asyncio.TaskGroup() as tg:
+             for page_num in range(1, num_pages + 1):
+                 task = tg.create_task(process_page(args, worker_id, pdf_orig_path, tf.name, page_num))
+                 page_tasks.append(task)
+
+         # PDF 파일의 전체 처리 결과를 저장
+         page_results = [task.result() for task in page_tasks]</code></pre>
+</li>
+<li><p>처리한 결과 검증 및 취합</p>
+<pre><code class="language-python">&quot;&quot;&quot;
+PDF 처리 결과의 최종 결과물
+dolma_doc를 통해 Markdown등으로 변환
+document_text: page_results 리스트의 natural_text를 이어 붙인 변수
+pdf_page_spans: 각 페이지의 텍스트가 document_text 내에서 어디부터 어디까지 차지하는지의 위치 정보
+&quot;&quot;&quot;
+def build_dolma_document(pdf_orig_path, page_results): # 파이프라인의 최종 결과물
+ (...)
+ metadata = {
+     &quot;Source-File&quot;: pdf_orig_path,
+     &quot;olmocr-version&quot;: VERSION,
+     &quot;pdf-total-pages&quot;: len(page_results),
+     &quot;total-input-tokens&quot;: sum(page.input_tokens for page in page_results),
+     &quot;total-output-tokens&quot;: sum(page.output_tokens for page in page_results),
+     &quot;total-fallback-pages&quot;: sum(page.is_fallback for page in page_results),
+ }
+
+ id_ = hashlib.sha1(document_text.encode()).hexdigest()
+
+ dolma_doc = {
+     &quot;id&quot;: id_,
+     &quot;text&quot;: document_text,
+     &quot;source&quot;: &quot;olmocr&quot;,
+     &quot;added&quot;: datetime.datetime.now().strftime(&quot;%Y-%m-%d&quot;),
+     &quot;created&quot;: datetime.datetime.now().strftime(&quot;%Y-%m-%d&quot;),
+     &quot;metadata&quot;: metadata,
+     &quot;attributes&quot;: {
+         &quot;pdf_page_numbers&quot;: pdf_page_spans,
+         &quot;primary_language&quot;: [p.response.primary_language for p in page_results],
+         &quot;is_rotation_valid&quot;: [p.response.is_rotation_valid for p in page_results],
+         &quot;rotation_correction&quot;: [p.response.rotation_correction for p in page_results],
+         &quot;is_table&quot;: [p.response.is_table for p in page_results],
+         &quot;is_diagram&quot;: [p.response.is_diagram for p in page_results],
+     },
+ }
+ return dolma_doc</code></pre>
+</li>
+<li><p>치명적 오류 처리 및 정리</p>
+</li>
+</ol>
+<hr />
+<h2 id="4-페이지-단위-처리">4. 페이지 단위 처리</h2>
+<h3 id="사용-함수-3">사용 함수</h3>
+<ul>
+<li><code>def process_page()</code></li>
+</ul>
+<h3 id="설명-3">설명</h3>
+<ul>
+<li>PDF의 단일 페이지 하나를 AI 모델로 처리하는 모든 과정을 관리</li>
+</ul>
+<h3 id="세부-역할-3">세부 역할</h3>
+<ol>
+<li><p>초기 변수 설정 및 엔드포인트 URL 설정</p>
+<pre><code class="language-python"> &quot;&quot;&quot;
+ 주요 변수
+
+ COMPLETION_URL: API 엔드포인트 URL
+ MODEL_MAX_CONTEXT: 사용하는 AI 모델이 처리할 수 있는 최대 context 길이(토큰 수), 16384
+ TEMPERATURE_BY_ATTEMPT: 재시도 횟수에 따라 사용할 temperature 값들을 미리 정의해 놓은 리스트, [0.1, 0.1, ~ , 0.9, 1.0]
+ cumulative_rotation: 페이지 이미지의 누적 회전 각도를 추적하는 변수 
+ &quot;&quot;&quot;</code></pre>
+</li>
+<li><p>최대 재시도 횟수에 도달할 때까지 페이지 처리 반복</p>
+</li>
+<li><p><strong>동적 요청 생성 및 API 호출</strong></p>
+<pre><code class="language-python">     &quot;&quot;&quot;
+     query: AI 모델 서버에 보낼 요청을 담고 있는 파이썬 딕셔너리(build_page_query 함수를 통해 생성)
+     args.target_longest_image_dim: PDF 페이지를 이미지로 랜더링 할 때, 생성될 이미지의 가장 긴 변의 목표 픽셀 크기를 지정하는 변수 값
+                                      AI 모델에 이미지를 입력하기 전 이미지 해상도 표준화 역할
+     &quot;&quot;&quot;
+     query = await build_page_query(
+         pdf_local_path,
+         page_num,
+         args.target_longest_image_dim,
+         image_rotation=cumulative_rotation,
+         model_name=model_name,
+     )
+     # Change temperature as number of attempts increases to overcome repetition issues at expense of quality
+     query[&quot;temperature&quot;] = TEMPERATURE_BY_ATTEMPT[lookup_attempt]
+
+     # 모델의 답변 형식 강제
+     if args.guided_decoding:
+         query[&quot;guided_regex&quot;] = (
+             r&quot;---\nprimary_language: (?:[a-z]{2}|null)\nis_rotation_valid: (?:True|False|true|false)\nrotation_correction: (?:0|90|180|270)\nis_table: (?:True|False|true|false)\nis_diagram: (?:True|False|true|false)\n(?:---|---\n[\s\S]+)&quot;
+         )</code></pre>
+</li>
+<li><p><strong>응답 처리 및 검증</strong></p>
+<pre><code class="language-python">     &quot;&quot;&quot;
+     api_key: 외부 서버에서 실행했을 때 필요한 API 키
+     apost 함수릁 통해 서버와 통신(추론) 진행
+     json_data: 서버로 요청할 데이터가 존재하는 매개변수
+     status_code: HTTPS 응답 상태 코드, 200일 때만 정상
+     response_body: 서버가 응답(response)한 내용, 추론 결과
+       &quot;&quot;&quot;   
+     try:
+         # 사용자가 외부 서버(--server)를 사용하도록 지정했고, API 키(--api_key)도 함께 제공했을 때
+         if args.server and hasattr(args, &quot;api_key&quot;):
+             api_key = args.api_key
+         else:
+             api_key = None
+         # api에게 추론을 요청하는 코드, status_code 200이면 요청/응답 정상 처리되는 것을 알 수 있음
+         status_code, response_body = await apost(COMPLETION_URL, json_data=query, api_key=api_key)</code></pre>
+<pre><code class="language-python"># response_body를 처리하여 만든 model_response_markdown 변수
+&quot;&quot;&quot;</code></pre>
+</li>
+</ol>
+<hr />
+<p>primary_language: en
+is_rotation_valid: True
+rotation_correction: 0
+is_table: False
+is_diagram: False</p>
+<hr />
+<p>This is the OCR text content extracted from the page.
+It can span multiple lines.
+&quot;&quot;&quot;</p>
+<pre><code>```python
+            &quot;&quot;&quot;
+            status_code가 200(정상)일 때 실행되는 부분
+            FrontMatterParser: Front Matter 형식의 텍스트를 파싱하기 위해 만들어진 클래스
+            front_matter: 모델 응답의 메타데이터 부분(딕셔너리 구조)
+            text: 메타데이터를 제외한 텍스트 본문
+            &quot;&quot;&quot;
+            # 모델 응답 에서 Front Matter(메타데이터)와 텍스트 본문 분리
+            parser = FrontMatterParser(front_matter_class=PageResponse)
+            front_matter, text = parser._extract_front_matter_and_text(model_response_markdown)
+            page_response = parser._parse_front_matter(front_matter, text)</code></pre><ol start="5">
+<li>예외 처리</li>
+<li>루프를 종료하고 난 후 모든 재시도가 실패했을 때 anchor 정보를 활용하여 처리<pre><code class="language-python">&quot;&quot;&quot;
+전통적인 방식의 OCR(vlm 사용 X)
+초기엔 anchor 정보를 프롬프트에 추가하여 vlm에 힌트 제공
+현재(1025버전 기준)는 메인으로 사용하지 않고, vlm이 추론에 실패했을 때 사용함
+</code></pre>
+</li>
+</ol>
+<p>pdftotext: poppler 라이브러리에 포함된 커맨드라인 도구, PDF에서 텍스트를 추출할 때 사용됨
+pdfium: 크롬에서 사용하는 PDF 렌더링 엔진(PDFium)의 파이썬 바인딩 버전
+pypdf: 파이썬 내장 라이브러리, 텍스트 추출 역활
+topcoherency: 3개의 엔진 중 하나를 선택하기 위한 호출 명령어
+&quot;&quot;&quot;
+def get_anchor_text(
+    local_pdf_path: str | PathLike, page: int, pdf_engine: Literal[&quot;pdftotext&quot;, &quot;pdfium&quot;, &quot;pypdf&quot;, &quot;topcoherency&quot;, &quot;pdfreport&quot;], target_length: int = 4000
+) -&gt; str:
+    assert page &gt; 0, &quot;Pages are 1-indexed in pdf-land&quot;</p>
+<pre><code>if pdf_engine == &quot;pdftotext&quot;:
+    return _get_pdftotext(local_pdf_path, page)
+elif pdf_engine == &quot;pdfium&quot;:
+    return _get_pdfium(local_pdf_path, page)
+elif pdf_engine == &quot;pypdf&quot;:
+    return _get_pypdf_raw(local_pdf_path, page)
+elif pdf_engine == &quot;topcoherency&quot;:
+    options = {
+        &quot;pdftotext&quot;: _get_pdftotext(local_pdf_path, page),
+        &quot;pdfium&quot;: _get_pdfium(local_pdf_path, page),
+        &quot;pypdf_raw&quot;: _get_pypdf_raw(local_pdf_path, page),
+    }</code></pre><pre><code>
+---
+
+## 5. AI 요청 생성
+### 사용 함수
+- `def build_page_query()`
+
+### 설명
+- PDF의 특정 페이지를 받아 이미지로 변환하고, 필요한 회전을 적용한 뒤 AI 모델 서버가 이해할 수 있는 표준 형식의 `JSON` 데이터를 만들어 반환함
+
+### 세부 역할
+1. PDF 페이지 랜더링 및 동시성 제어
+```python
+    &quot;&quot;&quot;
+    image_base64: 한 페이지를 poppler 라이브러리의 pdftoppm 유틸리티를 사용해 PNG 이미지를 출력히고 
+                    json에 포함시키기 위해 텍스트로 변환한 문자열 변수
+
+    poppler: PDF 파일을 랜더링하고 상호작용하기 위한 오픈소스 소프트웨어 라이브러리
+    pdftoppm: poppler 패키지에 포함된 명령어 유틸리티
+               PDF 파일의 페이지들을 이미지 파일로 변환하는 역할
+    &quot;&quot;&quot;
+    async with pdf_render_max_workers:
+        image_base64 = await asyncio.to_thread(render_pdf_to_base64png, local_pdf_path, page, target_longest_image_dim=target_longest_image_dim)</code></pre><ol start="2">
+<li>이미지 회전(필요 시)</li>
+<li>최종 API 요청 본문(query 변수) 생성<pre><code class="language-python"> return {
+     &quot;model&quot;: model_name,
+     &quot;messages&quot;: [
+         {
+             &quot;role&quot;: &quot;user&quot;,
+             &quot;content&quot;: [
+                 {&quot;type&quot;: &quot;text&quot;, &quot;text&quot;: build_no_anchoring_yaml_prompt()},
+                 {&quot;type&quot;: &quot;image_url&quot;, &quot;image_url&quot;: {&quot;url&quot;: f&quot;data:image/png;base64,{image_base64}&quot;}},
+             ],
+         }
+     ],
+     &quot;max_tokens&quot;: MAX_TOKENS,
+     &quot;temperature&quot;: 0.0,
+ }</code></pre>
+</li>
+</ol>
+<hr />
+<h2 id="6-low-level-네트워크-통신">6. Low-level 네트워크 통신</h2>
+<h3 id="사용-함수-4">사용 함수</h3>
+<ul>
+<li><code>def apost(url, json_data, api_key=None)</code> (&quot;Async Post&quot;)</li>
+</ul>
+<h3 id="설명-4">설명</h3>
+<ul>
+<li>파이프라인의 낮은 계층으로, 생성된 요청 데이터를 이용하여 네트워크를 통해 서버와 통신하는 역할</li>
+<li>기존 HTTP Post 라이브러리들은 1억건 정도 요청을 처리하는 규모에서 교착 상태(deadLock) 발생하여 직접 제작</li>
+</ul>
+<h3 id="세부-역할-4">세부 역할</h3>
+<ol>
+<li><p>주소 분석 및 연결 준비</p>
+</li>
+<li><p>서버와 연결</p>
+</li>
+<li><p>HTTP 요청 메시지 쟁성</p>
+<pre><code class="language-python">     &quot;&quot;&quot;
+     json_data: query 변수
+     json_payload: 서버로 보낼 실제 데이터를 JSON 형식의 문자열로 변환한 변수
+     headers: HTTP 요청의 메타데이터 리스트
+     request: headers와 json_payload을 종합한 서버 요청 메시지 문자열
+     &quot;&quot;&quot;
+     json_payload = json.dumps(json_data)
+
+     headers = [
+         f&quot;POST {path} HTTP/1.1&quot;,
+         f&quot;Host: {host}&quot;,
+         f&quot;Content-Type: application/json&quot;,
+         f&quot;Content-Length: {len(json_payload)}&quot;,
+     ]
+
+     if api_key:
+         headers.append(f&quot;Authorization: Bearer {api_key}&quot;)
+
+     headers.append(&quot;Connection: close&quot;)
+
+     request = &quot;\r\n&quot;.join(headers) + &quot;\r\n\r\n&quot; + json_payload</code></pre>
+</li>
+<li><p>요청 전송</p>
+</li>
+<li><p>응답 수신 및 분석</p>
+</li>
+<li><p>결과 반환</p>
+<pre><code class="language-python"> &quot;&quot;&quot;
+ status_code: HTTPS 응답 상태 코드, 200일 때만 정상
+ response_body: 서버가 응답(response)한 내용, 추론 결과
+ &quot;&quot;&quot;
+ return status_code, response_body</code></pre>
+</li>
+<li><p>예외 처리 및 자원 정리</p>
+</li>
+</ol>
+<hr />
+<h1 id="추가">추가</h1>
+<h2 id="pageresponse-객체">PageResponse 객체</h2>
+<h3 id="설명-5">설명</h3>
+<ul>
+<li><p>AI 모델이 생성한 응답을 파싱하여, 담아놓은 객체</p>
+<h3 id="구조">구조</h3>
+<pre><code class="language-python">@dataclass(frozen=True)
+class PageResponse:
+  primary_language: Optional[str]
+  is_rotation_valid: bool
+  rotation_correction: int
+  is_table: bool
+  is_diagram: bool
+  natural_text: Optional[str]</code></pre>
+<h3 id="creation">Creation</h3>
+</li>
+<li><p><code>process_page</code> 함수 내부에서 생성됨</p>
+<pre><code class="language-python"># process_page 함수 내부
+parser = FrontMatterParser(front_matter_class=PageResponse)
+front_matter, text = parser._extract_front_matter_and_text(...)
+
+# _parse_front_matter 메소드가 PageResponse 객체를 생성하여 반환
+page_response = parser._parse_front_matter(front_matter, text) </code></pre>
+<h3 id="usage">Usage</h3>
+</li>
+<li><p><code>process_page</code> 함수 내부에서 페이지 회전이 잘못되었는지 판단하고, 다음 시도에 반영할 회전 각도 결정(<code>is_rotation_valid</code>, <code>rotation_correction</code>)</p>
+</li>
+<li><p>더 큰 컨텍스트를 담는 <code>PageResult</code> 객체의 한 부분으로 포함됨</p>
+</li>
+</ul>
+<hr />
+<h2 id="pageresult-객체">PageResult 객체</h2>
+<h3 id="설명-6">설명</h3>
+<ul>
+<li><p>단일 페이지를 처리하는 전체 과정(process)의 최종 결과를 담고 있는 객체</p>
+<h3 id="구조-1">구조</h3>
+<pre><code class="language-python">@dataclass(frozen=True)
+class PageResult:
+  s3_path: str
+  page_num: int
+  response: PageResponse
+
+  input_tokens: int
+  output_tokens: int
+  is_fallback: bool</code></pre>
+<h3 id="creation-1">Creation</h3>
+</li>
+<li><p><code>process_page</code> 함수 내부에서 생성됨</p>
+<pre><code class="language-python"># process_page 함수 내부의 return 문
+return PageResult(
+  pdf_orig_path,
+  page_num,
+  page_response, # PageResponse 객체
+  input_tokens=...,
+  output_tokens=...,
+  is_fallback=False,
+)</code></pre>
+<h3 id="useage">Useage</h3>
+</li>
+<li><p>반환된 <code>PageResult</code> 객체들을 <code>process_pdf</code>함수의 <code>page_result</code> 리스트에 저장</p>
+<pre><code class="language-python">async def process_pdf(...):
+  # TaskGroup으로 여러 process_page를 실행 
+  page_results = [task.result() for task in page_tasks] # &lt;-- 여기에 PageResult 객체들 저장
+
+  # 최종 결과물 생성
+  dolma_doc = build_dolma_document(pdf_orig_path, page_results)
+)</code></pre>
+</li>
+<li><p><code>process_pdf</code> 함수 내부 <code>build_dolma_document</code>에서 인자로 사용되며, <code>PageResult</code>에 담긴 정보들을 조합하여 &quot;Dolma 문서&quot; 생성</p>
+<pre><code class="language-python">def build_dolma_document(pdf_orig_path, page_results):
+  for page_result in page_results:
+      content = page_result.response.natural_text
+      total_tokens += page_result.input_tokens
+  ...</code></pre>
+</li>
+</ul>
+<hr />
+<h2 id="poppler">Poppler</h2>
+<h3 id="설명-7">설명</h3>
+<ul>
+<li>PDF 파일을 렌더링하고 다양한 유틸리티를 제공(텍스트 추출, 메타데이터 파싱)하는 오픈소스 라이브러리 </li>
+<li>Poppler가 제공하는 <strong>pdftoppm</strong>이라는 커맨드라인 유틸리티 사용</li>
+</ul>
+<h3 id="usage-1">Usage</h3>
+<pre><code class="language-python">&quot;&quot;&quot;
+pdftoppm 명령어를 실행하고 결과를 받음
+render_pdf_to_base64png 함수 내부
+image_base64 = await asyncio.to_thread(render_pdf_to_base64png, local_pdf_path, page, target_longest_image_dim=target_longest_image_dim)
+&quot;&quot;&quot;
+pdftoppm_result = subprocess.run(
+    [
+        &quot;pdftoppm&quot;,                             # 1. 실행할 명령어
+        &quot;-png&quot;,                                 # 2. 출력 포맷 지정
+        &quot;-f&quot;, str(page_num),                    # 3. 시작 페이지 번호
+        &quot;-l&quot;, str(page_num),                    # 4. 마지막 페이지 번호
+        &quot;-r&quot;, str(target_longest_image_dim * 72 / longest_dim), # 5. 해상도(DPI) 동적 계산
+        local_pdf_path,                         # 6. 입력 PDF 파일 경로
+    ],
+    timeout=120,                                # 7. 타임아웃 설정
+    stdout=subprocess.PIPE,                     # 8. 표준 출력 캡처
+    stderr=subprocess.PIPE,                     # 9. 표준 에러 캡처
+)</code></pre>
+<h3 id="핵심-기능">핵심 기능</h3>
+<ul>
+<li>PDF 페이지를 이미지 파일(PNG)로 변환</li>
+</ul>
+<h3 id="역할">역할</h3>
+<ul>
+<li>PDF의 각 페이지를 AI 모델이 분석할 수 있도록 이미지 형식으로 변환하는 전처리 진행(서버에 요청을 보낼 때는 <code>Base64</code>로 인코딩 진행)</li>
+<li><code>build_page_query</code> 함수 내에서 <code>render_pdf_to_base64png</code> 를 통해 <strong>pdftoppm</strong>을 호출하여 변환 작업 수행</li>
+</ul>
+<hr />
+<h2 id="20251023-추가">2025/10/23 추가</h2>
+<ul>
+<li>새로운 모델(allenai/olmOCR-2-7B-1025-FP8) 출시</li>
+<li>기존 성능보다 4포인트 증가</li>
+<li>강화 학습(Reinforcement Learning) 도입</li>
+<li>프롬프트 변경<ul>
+<li>table을 markdown 에서 HTML 형식으로 출력 변경</li>
+<li>문서 내에 그림이나 차트가 있다면, 지정된 마크다운 이미지 문법을 사용하여 레이블을 지정<pre><code class="language-python">&quot;&quot;&quot;
+기존 프롬프트(v.0.3.9)
+&quot;&quot;&quot;
+def build_no_anchoring_yaml_prompt() -&gt; str:
+return (
+    &quot;Attached is one page of a document that you must process. &quot;
+    &quot;Just return the plain text representation of this document as if you were reading it naturally. Convert equations to LateX and tables to markdown.\n&quot;
+    &quot;Return your output as markdown, with a front matter section on top specifying values for the primary_language, is_rotation_valid, rotation_correction, is_table, and is_diagram parameters.&quot;
+)</code></pre>
+<pre><code class="language-python">&quot;&quot;&quot;
+최신 프롬프트(v0.4.0)
+&quot;&quot;&quot;
+def build_no_anchoring_v4_yaml_prompt() -&gt; str:
+return (
+    &quot;Attached is one page of a document that you must process. &quot;
+    &quot;Just return the plain text representation of this document as if you were reading it naturally. Convert equations to LateX and tables to HTML.\n&quot;
+    &quot;If there are any figures or charts, label them with the following markdown syntax ![Alt text describing the contents of the figure](page_startx_starty_width_height.png)\n&quot;
+    &quot;Return your output as markdown, with a front matter section on top specifying values for the primary_language, is_rotation_valid, rotation_correction, is_table, and is_diagram parameters.&quot;
+)</code></pre>
+</li>
+</ul>
+</li>
+</ul>
